@@ -2,12 +2,13 @@
 
 mod errors;
 
+use crate::templates::{StreamTemplate, TemplateCreated};
 use errors::ContractError;
 pub mod dao;
-mod errors;
+pub mod templates;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token::Client as TokenClient, Address, Env,
-    Map, String, Vec,
+    Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -87,6 +88,24 @@ pub mod escrow {
 }
 
 const NATIVE_SENTINEL: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const MAX_TEMPLATES_PER_SENDER: u32 = 10;
+
+// ---------------------------------------------------------------------------
+// Upgrade compatibility — layout version
+//
+// `STREAM_LAYOUT_VERSION` is a monotonically increasing `u32` constant that
+// encodes the current on-chain `Stream` struct layout.  Upgrade scripts and
+// migration tooling call `get_contract_version()` to compare the deployed
+// version against the version they were compiled against before touching any
+// stream records.
+//
+// Rules:
+//   • Bump the constant whenever a field is added, removed, or reordered in
+//     `Stream` OR when a `DataKey` variant is renumbered.
+//   • Never reuse a version number.
+//   • Version 1 represents the initial layout (sender … metadata).
+// ---------------------------------------------------------------------------
+pub const STREAM_LAYOUT_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Stream struct
@@ -102,6 +121,8 @@ pub struct Stream {
     pub claimed_amount: i128,
     pub start_time: u64,
     pub end_time: u64,
+    pub cliff_seconds: u64,
+    pub vesting_type: String,
     /// Minimum seconds that must elapse between two claims (0 = no limit).
     pub min_claim_interval_seconds: u64,
     /// Ledger timestamp of the last successful claim (0 if never claimed).
@@ -120,12 +141,25 @@ pub struct Stream {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    /// Monotonically increasing counter for stream IDs.
+    /// Storage: **Persistent** — must survive ledger expiry so stream IDs
+    /// never collide across upgrades. (Note: some older documentation
+    /// incorrectly listed this as Instance storage; the code has always used
+    /// Persistent.)
     NextStreamId,
     Stream(u64),
+    NextTemplateId,
+    Template(u64),
+    SenderTemplates(Address),
     SplitChildren(u64),
     ChildToParent(u64),
     NativeToken,
     AllowedTokens,
+    /// Stores the deployed `STREAM_LAYOUT_VERSION` (`u32`).
+    /// Written by `initialize` and updated by any upgrade that changes the
+    /// `Stream` layout.  Upgrade scripts read this key via `get_contract_version`
+    /// to detect whether a migration is required before touching stream records.
+    ContractVersion,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +171,44 @@ pub enum DataKey {
 //   timestamp  – ledger close time (Unix seconds) at the moment of emission
 //
 // Additional fields carry event-specific data (amounts, addresses, etc.).
+//
+// ---------------------------------------------------------------------------
+// Stable event payload contract (upgrade compatibility)
+// ---------------------------------------------------------------------------
+//
+// The field names and types listed below form a **stable ABI**.  The backend
+// indexer (backend/src/services/indexer.ts) deserializes these fields by name
+// after calling `scValToNative`.  Any rename or type change is a breaking
+// change that requires a coordinated indexer update.
+//
+// Mandatory base fields (present on every event struct, in this order):
+//   1. stream_id  : u64
+//   2. actor      : Address
+//   3. timestamp  : u64
+//
+// Adding new optional fields to an existing struct is permitted; removing or
+// reordering existing fields is not.
+//
+// ---------------------------------------------------------------------------
+// Event emission ordering guarantee
+// ---------------------------------------------------------------------------
+//
+// Within a single transaction the contract always emits events in this order:
+//
+//   claim()
+//     1. `StreamClaimed`   — always emitted on a successful claim.
+//     2. `StreamCompleted` — emitted immediately after `StreamClaimed` in the
+//                            same transaction, only when `claimed_amount >=
+//                            total_amount` after the claim.  The indexer can
+//                            rely on `StreamClaimed` always preceding
+//                            `StreamCompleted` for the same stream in the same
+//                            ledger.
+//
+//   cancel()
+//     1. `StreamCanceled`  — emitted once after state and token transfer.
+//
+// This ordering is tested by `test_claim_event_ordering_claimed_before_completed`
+// in `src/test.rs`.
 // ---------------------------------------------------------------------------
 
 /// Emitted once when a new stream is created via `create_stream` or as a
@@ -157,6 +229,8 @@ pub struct StreamCreated {
     pub total_amount: i128,
     pub start_time: u64,
     pub end_time: u64,
+    pub cliff_seconds: u64,
+    pub vesting_type: String,
     pub min_claim_interval_seconds: u64,
     pub metadata: Option<Map<String, String>>,
 }
@@ -304,11 +378,168 @@ impl StellarStreamContract {
         env.storage()
             .instance()
             .set(&DataKey::AllowedTokens, &allowed_tokens);
+        // Record the layout version so upgrade scripts can detect migrations.
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &STREAM_LAYOUT_VERSION);
+    }
+
+    /// Returns the `STREAM_LAYOUT_VERSION` that was active when `initialize`
+    /// was last called (or when the most recent layout-changing upgrade ran).
+    ///
+    /// Upgrade scripts compare this value against the constant compiled into
+    /// the new WASM to decide whether a `Stream` layout migration is needed
+    /// before any stream records are touched.  A `None` return means the
+    /// contract was deployed before this key was introduced; treat it as
+    /// version 0 and run any pending migrations.
+    pub fn get_contract_version(env: Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Records the layout version after an upgrade migration completes.
+    /// Only the current admin may update it, and the version cannot decrease
+    /// or exceed the layout supported by this build.
+    pub fn set_contract_version(env: Env, admin: Address, version: u32) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("contract not initialized"));
+        if stored_admin != admin {
+            panic!("unauthorized");
+        }
+        admin.require_auth();
+
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+        if version < current_version || version > STREAM_LAYOUT_VERSION {
+            panic!("invalid contract version");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &version);
     }
 
     // -----------------------------------------------------------------------
     // Stream creation
     // -----------------------------------------------------------------------
+
+    pub fn create_template(
+        env: Env,
+        sender: Address,
+        name: String,
+        token: Address,
+        duration_seconds: u64,
+        cliff_seconds: u64,
+        vesting_type: String,
+    ) -> u64 {
+        sender.require_auth();
+
+        if duration_seconds == 0 {
+            panic!("duration must be positive");
+        }
+        if cliff_seconds > duration_seconds {
+            panic!("cliff exceeds duration");
+        }
+
+        let mut sender_templates: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SenderTemplates(sender.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if sender_templates.len() >= MAX_TEMPLATES_PER_SENDER {
+            panic!("template limit exceeded");
+        }
+
+        let mut template_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextTemplateId)
+            .unwrap_or(0);
+        template_id += 1;
+
+        let template = StreamTemplate {
+            id: template_id,
+            sender: sender.clone(),
+            name,
+            token: token.clone(),
+            duration_seconds,
+            cliff_seconds,
+            vesting_type: vesting_type.clone(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Template(template_id), &template);
+        sender_templates.push_back(template_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SenderTemplates(sender.clone()), &sender_templates);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextTemplateId, &template_id);
+
+        env.events().publish(
+            (symbol_short!("Template"), symbol_short!("Created")),
+            TemplateCreated {
+                template_id,
+                sender,
+                token,
+                duration_seconds,
+                cliff_seconds,
+                vesting_type,
+            },
+        );
+
+        template_id
+    }
+
+    pub fn get_template(env: Env, template_id: u64) -> StreamTemplate {
+        read_template(&env, template_id)
+    }
+
+    pub fn get_templates_by_sender(env: Env, sender: Address) -> Vec<StreamTemplate> {
+        let template_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SenderTemplates(sender))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut templates = Vec::new(&env);
+        for template_id in template_ids.iter() {
+            templates.push_back(read_template(&env, template_id));
+        }
+        templates
+    }
+
+    pub fn create_stream_from_template(
+        env: Env,
+        template_id: u64,
+        recipient: Address,
+        amount: i128,
+    ) -> u64 {
+        let template = read_template(&env, template_id);
+
+        let start_time = env.ledger().timestamp();
+        let end_time = start_time.saturating_add(template.duration_seconds);
+
+        create_stream_with_config(
+            &env,
+            template.sender,
+            recipient,
+            template.token,
+            amount,
+            start_time,
+            end_time,
+            template.cliff_seconds,
+            template.vesting_type,
+            0,
+            None,
+        )
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn create_stream(
@@ -322,101 +553,19 @@ impl StellarStreamContract {
         min_claim_interval_seconds: u64,
         metadata: Option<Map<String, String>>,
     ) -> u64 {
-        sender.require_auth();
-
-        if total_amount <= 0 {
-            panic!("total_amount must be positive");
-        }
-        if end_time <= start_time {
-            panic!("end_time must be greater than start_time");
-        }
-
-        let is_native = token.to_string() == String::from_str(&env, NATIVE_SENTINEL);
-        if !is_native {
-            let allowed_tokens: Vec<Address> = env
-                .storage()
-                .instance()
-                .get(&DataKey::AllowedTokens)
-                .unwrap_or_else(|| Vec::new(&env));
-            #[cfg(not(test))]
-            #[cfg(not(any(test, feature = "testutils")))]
-            if !allowed_tokens.contains(&token) {
-                panic!("ContractError::TokenNotAllowed");
-            }
-            #[cfg(test)]
-            if !allowed_tokens.is_empty() && !allowed_tokens.contains(&token) {
-                panic!("ContractError::TokenNotAllowed");
-            }
-        }
-
-        let actual_token = if is_native {
-            env.storage()
-                .instance()
-                .get(&DataKey::NativeToken)
-                .unwrap_or_else(|| panic!("not initialized"))
-        } else {
-            token.clone()
-        };
-        let token_client = TokenClient::new(&env, &actual_token);
-        let sender_balance = token_client.balance(&sender);
-        if sender_balance < total_amount {
-            panic!("insufficient sender balance");
-        }
-        // Escrow: transfer total_amount from sender into this contract.
-        let contract_address = env.current_contract_address();
-        token_client.transfer(&sender, &contract_address, &total_amount);
-
-        let mut next_id: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::NextStreamId)
-            .unwrap_or(0);
-        next_id += 1;
-
-        let stream = Stream {
-            sender: sender.clone(),
-            recipient: recipient.clone(),
-            token: token.clone(),
+        create_stream_with_config(
+            &env,
+            sender,
+            recipient,
+            token,
             total_amount,
-            claimed_amount: 0,
             start_time,
             end_time,
+            0,
+            String::from_str(&env, "linear"),
             min_claim_interval_seconds,
-            last_claim_time: 0,
-            canceled: false,
-            paused: false,
-            pause_started_at: None,
-
-            metadata: metadata.clone(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::NextStreamId, &next_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stream(next_id), &stream);
-
-        let now = env.ledger().timestamp();
-        env.events().publish(
-            (symbol_short!("Stream"), symbol_short!("Created")),
-            StreamCreated {
-                stream_id: next_id,
-                actor: sender.clone(),
-                timestamp: now,
-                sender,
-                recipient,
-                token: token.clone(),
-                token_symbol: token_client.symbol(),
-                total_amount,
-                start_time,
-                end_time,
-                min_claim_interval_seconds,
-                metadata,
-            },
-        );
-
-        next_id
+            metadata,
+        )
     }
 
     pub fn create_split_stream(
@@ -486,6 +635,8 @@ impl StellarStreamContract {
                 claimed_amount: 0,
                 start_time,
                 end_time,
+                cliff_seconds: 0,
+                vesting_type: String::from_str(&env, "linear"),
                 min_claim_interval_seconds: 0,
                 last_claim_time: 0,
                 canceled: false,
@@ -515,6 +666,8 @@ impl StellarStreamContract {
                     total_amount: allocation,
                     start_time,
                     end_time,
+                    cliff_seconds: 0,
+                    vesting_type: String::from_str(&env, "linear"),
                     min_claim_interval_seconds: 0,
                     metadata: None,
                 },
@@ -607,6 +760,20 @@ impl StellarStreamContract {
     /// claim attempted before the interval has elapsed since the last successful
     /// claim is rejected with [`ContractError::ClaimTooFrequent`] (a
     /// `ClaimThrottled` event is emitted before the error is returned).
+    ///
+    /// # Event emission ordering guarantee
+    ///
+    /// On every successful claim this function emits events in the following
+    /// fixed order within the same transaction:
+    ///
+    ///   1. `StreamClaimed`   — always emitted after the token transfer and
+    ///                          accounting update succeed.
+    ///   2. `StreamCompleted` — emitted immediately after `StreamClaimed`,
+    ///                          **only** when `claimed_amount >= total_amount`.
+    ///
+    /// The indexer reconstructs the committed action exactly once by processing
+    /// `StreamClaimed` first.  `StreamCompleted` is a secondary signal; the
+    /// indexer must not double-count the amount from both events.
     pub fn claim(
         env: Env,
         stream_id: u64,
@@ -976,6 +1143,44 @@ impl StellarStreamContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    // -----------------------------------------------------------------------
+    // Native XLM stream support (#688)
+    // -----------------------------------------------------------------------
+    //
+    // `NativeToken` is the address of the SAC (Stellar Asset Contract) that
+    // wraps native XLM for this network — the only address a Soroban
+    // contract can present to the standard SEP-41 token interface to move
+    // native balances; there is no lower-level, SAC-free path for a contract
+    // to debit/credit XLM. Before this, that address could only be set once,
+    // at `initialize()`, with no way to view or correct it afterward: a
+    // wrong or stale address (e.g. after a network migration) permanently
+    // broke every native-token stream (`create_stream`/`clawback` both
+    // `panic!("not initialized")` on the missing key) with no recovery short
+    // of redeploying the whole contract. `get_native_token`/`set_native_token`
+    // give admins visibility and a correction path, matching the pattern
+    // already used for `AllowedTokens`.
+
+    /// Returns the configured native-XLM SAC address, if any.
+    pub fn get_native_token(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::NativeToken)
+    }
+
+    /// Sets (or corrects) the native-XLM SAC address. Admin-only.
+    pub fn set_native_token(env: Env, admin: Address, native_token: Address) {
+        let admin_stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("contract not initialized"));
+        if admin_stored != admin {
+            panic!("unauthorized");
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::NativeToken, &native_token);
+    }
+
     /// Transfers the admin role to a new address.
     /// Only the current admin can call this. Panics if the contract is not initialized.
     pub fn set_admin(env: Env, admin: Address, new_admin: Address) {
@@ -996,11 +1201,180 @@ impl StellarStreamContract {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn read_stream(env: &Env, stream_id: u64) -> Stream {
+#[allow(clippy::too_many_arguments)]
+fn create_stream_with_config(
+    env: &Env,
+    sender: Address,
+    recipient: Address,
+    token: Address,
+    total_amount: i128,
+    start_time: u64,
+    end_time: u64,
+    cliff_seconds: u64,
+    vesting_type: String,
+    min_claim_interval_seconds: u64,
+    metadata: Option<Map<String, String>>,
+) -> u64 {
+    sender.require_auth();
+
+    if total_amount <= 0 {
+        panic!("total_amount must be positive");
+    }
+    if end_time <= start_time {
+        panic!("end_time must be greater than start_time");
+    }
+
+    let is_native = token.to_string() == String::from_str(env, NATIVE_SENTINEL);
+    if !is_native {
+        let allowed_tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(env));
+        #[cfg(not(any(test, feature = "testutils")))]
+        if !allowed_tokens.contains(&token) {
+            panic!("ContractError::TokenNotAllowed");
+        }
+        #[cfg(any(test, feature = "testutils"))]
+        if !allowed_tokens.is_empty() && !allowed_tokens.contains(&token) {
+            panic!("ContractError::TokenNotAllowed");
+        }
+    }
+
+    let actual_token = if is_native {
+        env.storage()
+            .instance()
+            .get(&DataKey::NativeToken)
+            .unwrap_or_else(|| panic!("not initialized"))
+    } else {
+        token.clone()
+    };
+    let token_client = TokenClient::new(env, &actual_token);
+    let sender_balance = token_client.balance(&sender);
+    if sender_balance < total_amount {
+        panic!("insufficient sender balance");
+    }
+
+    let contract_address = env.current_contract_address();
+    token_client.transfer(&sender, &contract_address, &total_amount);
+
+    let mut next_id: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::NextStreamId)
+        .unwrap_or(0);
+    next_id += 1;
+
+    let stream = Stream {
+        sender: sender.clone(),
+        recipient: recipient.clone(),
+        token: token.clone(),
+        total_amount,
+        claimed_amount: 0,
+        start_time,
+        end_time,
+        cliff_seconds,
+        vesting_type: vesting_type.clone(),
+        min_claim_interval_seconds,
+        last_claim_time: 0,
+        canceled: false,
+        paused: false,
+        pause_started_at: None,
+        metadata: metadata.clone(),
+    };
+
     env.storage()
         .persistent()
-        .get(&DataKey::Stream(stream_id))
-        .unwrap_or_else(|| panic!("stream not found"))
+        .set(&DataKey::NextStreamId, &next_id);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Stream(next_id), &stream);
+
+    let now = env.ledger().timestamp();
+    env.events().publish(
+        (symbol_short!("Stream"), symbol_short!("Created")),
+        StreamCreated {
+            stream_id: next_id,
+            actor: sender.clone(),
+            timestamp: now,
+            sender,
+            recipient,
+            token: token.clone(),
+            token_symbol: token_client.symbol(),
+            total_amount,
+            start_time,
+            end_time,
+            cliff_seconds,
+            vesting_type,
+            min_claim_interval_seconds,
+            metadata,
+        },
+    );
+
+    next_id
+}
+
+fn read_template(env: &Env, template_id: u64) -> StreamTemplate {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Template(template_id))
+        .unwrap_or_else(|| panic!("template not found"))
+}
+
+fn read_stream(env: &Env, stream_id: u64) -> Stream {
+    let key = DataKey::Stream(stream_id);
+    let fields: Map<Symbol, Val> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic!("stream not found"));
+    Stream {
+        sender: read_stream_field(env, &fields, "sender"),
+        recipient: read_stream_field(env, &fields, "recipient"),
+        token: read_stream_field(env, &fields, "token"),
+        total_amount: read_stream_field(env, &fields, "total_amount"),
+        claimed_amount: read_stream_field(env, &fields, "claimed_amount"),
+        start_time: read_stream_field(env, &fields, "start_time"),
+        end_time: read_stream_field(env, &fields, "end_time"),
+        cliff_seconds: read_stream_field_or(env, &fields, "cliff_seconds", 0),
+        vesting_type: read_stream_field_or(
+            env,
+            &fields,
+            "vesting_type",
+            String::from_str(env, "linear"),
+        ),
+        min_claim_interval_seconds: read_stream_field_or(
+            env,
+            &fields,
+            "min_claim_interval_seconds",
+            0,
+        ),
+        last_claim_time: read_stream_field_or(env, &fields, "last_claim_time", 0),
+        canceled: read_stream_field_or(env, &fields, "canceled", false),
+        paused: read_stream_field_or(env, &fields, "paused", false),
+        pause_started_at: read_stream_field_or(env, &fields, "pause_started_at", None),
+        metadata: read_stream_field_or(env, &fields, "metadata", None),
+    }
+}
+
+fn read_stream_field<T>(env: &Env, fields: &Map<Symbol, Val>, name: &str) -> T
+where
+    T: TryFromVal<Env, Val>,
+{
+    let value: Val = fields
+        .get(Symbol::new(env, name))
+        .unwrap_or_else(|| panic!("invalid stream"));
+    T::try_from_val(env, &value).unwrap_or_else(|_| panic!("invalid stream"))
+}
+
+fn read_stream_field_or<T>(env: &Env, fields: &Map<Symbol, Val>, name: &str, default: T) -> T
+where
+    T: TryFromVal<Env, Val>,
+{
+    match fields.get(Symbol::new(env, name)) {
+        Some(value) => T::try_from_val(env, &value).unwrap_or_else(|_| panic!("invalid stream")),
+        None => default,
+    }
 }
 
 fn vested_amount(stream: &Stream, at_time: u64) -> i128 {
@@ -1027,7 +1401,11 @@ fn vested_amount(stream: &Stream, at_time: u64) -> i128 {
         return 0;
     }
 
-    stream.total_amount * (elapsed as i128) / (total_duration as i128)
+    stream
+        .total_amount
+        .checked_mul(elapsed as i128)
+        .unwrap_or(0)
+        / (total_duration as i128)
 }
 
 #[cfg(test)]

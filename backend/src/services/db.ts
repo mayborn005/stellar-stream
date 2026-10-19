@@ -1,6 +1,12 @@
 import Database from "better-sqlite3";
 import path from "path";
 import { runMigrations } from "./migrations";
+import {
+  getLiveRestoreOutcomeSignal,
+  recordRestoreOutcome,
+  refreshRestoreMetrics,
+} from "./dbRestoreOutcome";
+import { logger } from "../logger";
 
 const DB_PATH =
   process.env.DB_PATH || path.join(__dirname, "..", "..", "data", "streams.db");
@@ -308,6 +314,58 @@ class PostgresDatabase {
   }
 }
 
+export function syncFtsIndex(id: string, sender: string, recipient: string, assetCode: string): void {
+  if (isPostgres()) return;
+  // FTS index sync is currently a no-op; the streams_fts virtual table
+  // is only created for SQLite and is handled separately if needed.
+}
+
+/**
+ * Adds a column to a table if it doesn't already exist.
+ * Safe for both SQLite and Postgres.
+ */
+function addColumnIfMissing(database: any, table: string, column: string, typeDef: string): void {
+  try {
+    const cols = database
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as Array<{ name: string }>;
+    if (cols.some((c) => c.name === column)) return;
+  } catch {
+    // If PRAGMA fails (e.g. table does not exist), skip.
+    return;
+  }
+  database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeDef}`);
+}
+
+/**
+ * Records the schema check performed when the database is opened — the point
+ * at which a restore from a prior point in time takes effect. Counts and state
+ * only: the signal never carries the database path, migration names, or user
+ * data, so it is safe to log, scrape, and paste into an incident channel.
+ *
+ * A database with no recorded schema yet (fresh install or empty volume) is
+ * recorded as `transient_delay`, because startup still has migrations to
+ * apply. This makes a fresh Compose volume observable without exposing paths
+ * or configuration values.
+ */
+function recordSqliteRestoreOutcome(database: any): void {
+  try {
+    const signal = getLiveRestoreOutcomeSignal(database);
+    recordRestoreOutcome(signal);
+    refreshRestoreMetrics(signal);
+    if (signal.outcome === "blocked") {
+      logger.warn(
+        { restoreOutcome: signal },
+        "SQLite restore outcome: schema is ahead of the running code",
+      );
+    } else {
+      logger.info({ restoreOutcome: signal }, "SQLite restore outcome recorded");
+    }
+  } catch (error) {
+    logger.warn({ err: error }, "failed to record SQLite restore outcome");
+  }
+}
+
 export function initDb(): void {
   if (isPostgres()) {
     db = new PostgresDatabase(process.env.DATABASE_URL!);
@@ -324,7 +382,15 @@ export function initDb(): void {
     db.pragma("synchronous = NORMAL");
     db.pragma("busy_timeout = 5000");
     db.pragma("cache_size = -64000");
+
+    // Capture the restored schema before any pending migration runs, so the
+    // recorded outcome describes the snapshot the operator actually restored.
+    recordSqliteRestoreOutcome(db);
   }
 
   runMigrations(db);
+
+  // Incremental schema patches for columns added after the baseline.
+  addColumnIfMissing(db, "streams", "cliff_seconds", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing(db, "stream_archive", "cliff_seconds", "INTEGER NOT NULL DEFAULT 0");
 }
